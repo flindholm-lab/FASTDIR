@@ -1,5 +1,5 @@
 # FastDir
-<img width="636" height="182" alt="image" src="https://github.com/user-attachments/assets/16163cb5-4049-424a-a0ad-656c544dda7b" />
+<img width="636" height="238" alt="image" src="https://github.com/user-attachments/assets/815c3ee1-d115-4f32-8472-c2ce7b5e3b41" />
 
 
 **FastDir (v2.42)** is a high-performance, drop-in replacement for the standard `DIR` command in MS-DOS and PC-DOS.
