@@ -3,7 +3,7 @@
 { Compatible with Turbo Pascal 6.0, 7.0, and Free Pascal (go32v2 target)      }
 {                                                                             }
 { Designed for slow PCs (8088/8086, 286, 386, XT-IDE, CF cards, large disks): }
-{   - Safe DOS 7.10+ FAT32 check (prevents interrupt lockups on older DOS)    }
+{   - Safe FAT32 free-space probe on any DOS 5+ (preset-carry detection)     }
 {   - Instant free-space bypass switch (/Q or /-F)                            }
 {   - Reads DIRCMD environment variable on startup                            }
 {   - Heap-based Quicksort avoiding DSEG 64K limits                           }
@@ -55,7 +55,7 @@ uses
           ReadKey is replaced by a direct BIOS Int 16h call below. }
 
 const
-  PROG_VERSION   = '2.50-TP';
+  PROG_VERSION   = '2.53-TP';
   MAX_ENTRIES    = 2048; { Maximum number of files processed per directory }
   MAX_SUBDIRS    = 256;  { Maximum subdirectories tracked per level for /S }
   WIDE_COLS      = 5;    { Number of columns for Wide (/W) display format }
@@ -172,6 +172,14 @@ var
   TotalDirs      : LongInt;
   TotalBytes     : Big;      { 64-bit: /S over a large tree exceeds 2 GB }
 
+  { Country-dependent formatting, from DOS Int 21h AH=38h (like real DIR):
+    e.g. COUNTRY=046 (Sweden) uses space as thousands separator and
+    yy-mm-dd dates }
+  ThousandsSep   : Char;     { Separator for FormatNumber/FormatBig }
+  DateSep        : Char;     { Date field separator }
+  TimeSep        : Char;     { Time field separator }
+  DateFmt        : Word;     { 0=mm dd yy (USA), 1=dd mm yy, 2=yy mm dd }
+
   { 4 KB output buffer: DOS Int 21h write calls drop from one per ~128
     bytes to one per 4 KB. Massive win on 8088 for /S and /B listings,
     and for output redirected to a file. }
@@ -246,6 +254,37 @@ end;
 { DATA FORMATTING UTILITIES                                                   }
 { =========================================================================== }
 
+{ Reads the active DOS country information (Int 21h AH=38h) and captures
+  the thousands separator, date/time separators and date field order,
+  so numbers and dates match what real DIR prints under any COUNTRY= }
+procedure InitCountry;
+var
+  Regs : Registers;
+  Buf  : array[0..33] of Byte;
+begin
+  { Safe US-style defaults if the call fails }
+  ThousandsSep := ',';
+  DateSep      := '-';
+  TimeSep      := ':';
+  DateFmt      := 0;
+
+  FillChar(Regs, SizeOf(Regs), 0);
+  FillChar(Buf, SizeOf(Buf), 0);
+  Regs.AX := $3800;  { AL=0: current country }
+  Regs.DS := Seg(Buf);
+  Regs.DX := Ofs(Buf);
+  Intr($21, Regs);
+
+  if (Regs.Flags and FCarry) = 0 then
+  begin
+    DateFmt := Buf[0] or (Word(Buf[1]) shl 8);
+    if DateFmt > 2 then DateFmt := 0;
+    if Buf[7]  <> 0 then ThousandsSep := Chr(Buf[7]);   { ofs 07h }
+    if Buf[11] <> 0 then DateSep      := Chr(Buf[11]);  { ofs 0Bh }
+    if Buf[13] <> 0 then TimeSep      := Chr(Buf[13]);  { ofs 0Dh }
+  end;
+end;
+
 { Inserts thousands separators into a raw digit string }
 function CommaFy(const Raw: string): string;
 var
@@ -260,9 +299,9 @@ begin
   begin
     ResultStr := Raw[I] + ResultStr;
     Inc(PosCount);
-    { Add comma every 3 digits, never directly after a minus sign }
+    { Separator every 3 digits, never directly after a minus sign }
     if (PosCount mod 3 = 0) and (I > 1) and (Raw[I - 1] <> '-') then
-      ResultStr := ',' + ResultStr;
+      ResultStr := ThousandsSep + ResultStr;
   end;
   CommaFy := ResultStr;
 end;
@@ -309,7 +348,13 @@ begin
   Str((DT.Year mod 100):2, YStr);
   if YStr[1] = ' ' then YStr[1] := '0';
 
-  DateStr := MoStr + '-' + DStr + '-' + YStr;
+  { Assemble the date in the country's field order and separator }
+  case DateFmt of
+    1: DateStr := DStr + DateSep + MoStr + DateSep + YStr;  { dd mm yy }
+    2: DateStr := YStr + DateSep + MoStr + DateSep + DStr;  { yy mm dd }
+  else
+    DateStr := MoStr + DateSep + DStr + DateSep + YStr;     { mm dd yy }
+  end;
 
   if OptAmPm then
   begin
@@ -335,7 +380,7 @@ begin
     Str(DT.Min:2, MStr);
     if MStr[1] = ' ' then MStr[1] := '0';
 
-    TimeStr := HStr + ':' + MStr + AmPm;
+    TimeStr := HStr + TimeSep + MStr + AmPm;
   end
   else
   begin
@@ -347,7 +392,7 @@ begin
 
     { Trailing space keeps the column exactly as wide as the am/pm
       variant so /T and default output align identically }
-    TimeStr := HStr + ':' + MStr + ' ';
+    TimeStr := HStr + TimeSep + MStr + ' ';
   end;
 end;
 
@@ -363,6 +408,7 @@ function StdOutIsConsole: Boolean;
 var
   Regs: Registers;
 begin
+  FillChar(Regs, SizeOf(Regs), 0);
   Regs.AX := $4400;
   Regs.BX := 1; { STDOUT handle }
   Intr($21, Regs);
@@ -407,6 +453,7 @@ begin
     VSeg := $B800;
 
   { Fetch current cursor position once per string }
+  FillChar(Regs, SizeOf(Regs), 0);
   Regs.AH := $03;
   Regs.BH := Page;
   Intr($10, Regs);
@@ -486,6 +533,7 @@ function WaitForKey: Char;
 var
   Regs: Registers;
 begin
+  FillChar(Regs, SizeOf(Regs), 0);
   Regs.AH := $00;
   Intr($16, Regs);
   WaitForKey := Chr(Regs.AL);
@@ -585,6 +633,7 @@ begin
 
   { Get Volume Serial Number via Int 21h AX=6900h }
   FillChar(MediaID, SizeOf(MediaID), 0);
+  FillChar(Regs, SizeOf(Regs), 0);
   Regs.AX := $6900;
   Regs.BL := DriveNum;
   Regs.DS := Seg(MediaID);
@@ -786,6 +835,7 @@ var
   Success      : Boolean;
   EstBytes     : Big;
   EstExact     : Boolean;
+  FreeBig      : Big;
 begin
   if OptBare then Exit;
 
@@ -808,38 +858,47 @@ begin
     TP's DosVersion returns major in the LOW byte, minor in the HIGH byte. }
   DosVer := DosVersion;
 
-  { DOS 7.10+ supports FAT32 ExtGetFreeSpace }
-  if (Lo(DosVer) > 7) or ((Lo(DosVer) = 7) and (Hi(DosVer) >= 10)) then
+  { Probe for FAT32 ExtGetFreeSpace on any DOS 5+. Gating on version
+    7.10 misses environments that support the call but report an older
+    version (DOSBox-X defaults to 5.0, FreeDOS setups, SETVER) - their
+    own DIR uses the FAT32 API internally, so we must try it too.
+    The probe is safe on kernels without it: CF is preset, and old DOS
+    returns AL=0 for unknown 73h functions, making AX exactly $7300. }
+  if Lo(DosVer) >= 5 then
   begin
     FillChar(FAT32Data, SizeOf(FAT32Data), 0);
     FAT32Data.StructureSize := SizeOf(FAT32Data);
 
+    { Regs MUST be zeroed: TP's Intr loads CPU flags from the record,
+      and garbage direction/trap flag bits make DOS calls fail randomly }
+    FillChar(Regs, SizeOf(Regs), 0);
     Regs.AX := $7303; { ExtGetFreeSpace }
     Regs.DS := Seg(RootStr[1]);
     Regs.DX := Ofs(RootStr[1]);
     Regs.ES := Seg(FAT32Data);
     Regs.DI := Ofs(FAT32Data);
     Regs.CX := SizeOf(FAT32Data);
-    Regs.Flags := Regs.Flags or FCarry; { Defensive: preset CF }
+    Regs.Flags := FCarry; { Preset CF: unsupported call leaves it set }
     Intr($21, Regs);
 
-    if ((Regs.Flags and FCarry) = 0) and (Regs.AX <> $7300) then
+    if ((Regs.Flags and FCarry) = 0) and (Regs.AX <> $7300) and
+       { Sanity-check the returned structure before trusting it }
+       (FAT32Data.SectorsPerCluster > 0) and
+       (FAT32Data.SectorsPerCluster <= 128) and
+       (FAT32Data.BytesPerSector >= 128) and
+       (FAT32Data.BytesPerSector <= 4096) and
+       (FAT32Data.AvailableClusters >= 0) and
+       (FAT32Data.AvailableClusters <= FAT32Data.TotalClusters) then
     begin
-      ClustersFree := FAT32Data.AvailableClusters;
       ClusterBytes := FAT32Data.SectorsPerCluster * FAT32Data.BytesPerSector;
-
-      { Check for LongInt overflow on extremely large partitions }
-      if (ClusterBytes > 0) and (ClustersFree < ($7FFFFFFF div ClusterBytes)) then
+      if ClusterBytes > 0 then
       begin
-        BytesFree := ClustersFree * ClusterBytes;
-        Success := True;
-      end
-      else if ClusterBytes >= 1024 then
-      begin
-        { Byte count would overflow LongInt - report in KB instead }
+        { 64-bit math: large FAT32 volumes exceed LongInt range, and
+          real DIR prints the exact byte count - so do we }
+        FreeBig := FAT32Data.AvailableClusters;
+        FreeBig := FreeBig * ClusterBytes;
         PrintLine(PadLeft(FormatNumber(TotalDirs), 16) + ' Dir(s) ' +
-                  PadLeft(FormatNumber(ClustersFree * (ClusterBytes div 1024)), 14) +
-                  ' KB free');
+                  PadLeft(FormatBig(FreeBig), 17) + ' bytes free');
         Exit;
       end;
     end;
@@ -866,6 +925,7 @@ begin
   { Fallback to legacy DOS Int 21h AH=36h (Get Free Space) }
   if not Success then
   begin
+    FillChar(Regs, SizeOf(Regs), 0);
     Regs.AH := $36;
     Regs.DL := DriveNum;
     Intr($21, Regs);
@@ -884,8 +944,17 @@ begin
 
   { Final output generation }
   if Success then
-    PrintLine(PadLeft(FormatNumber(TotalDirs), 16) + ' Dir(s) ' +
-              PadLeft(FormatNumber(BytesFree), 17) + ' bytes free')
+  begin
+    { Under Windows NT/2000/XP the DOS box (NTVDM) caps AH=36h results,
+      so the figure is a floor, not the real free space - say so }
+    if GetEnv('OS') = 'Windows_NT' then
+      PrintLine(PadLeft(FormatNumber(TotalDirs), 16) + ' Dir(s) ' +
+                PadLeft(FormatNumber(BytesFree), 17) +
+                ' bytes free (NT cap)')
+    else
+      PrintLine(PadLeft(FormatNumber(TotalDirs), 16) + ' Dir(s) ' +
+                PadLeft(FormatNumber(BytesFree), 17) + ' bytes free');
+  end
   else
     PrintLine(PadLeft(FormatNumber(TotalDirs), 16) +
               ' Dir(s)   [Free space unavailable]');
@@ -1627,6 +1696,10 @@ begin
   { Install 4 KB output buffer BEFORE anything is written. Reduces DOS
     Int 21h write calls ~32x versus the default 128-byte buffer. }
   SetTextBuf(Output, OutBuf);
+
+  { Pick up COUNTRY= formatting (thousands separator, date order) so
+    output matches real DIR on non-US configurations }
+  InitCountry;
 
   TotalFiles  := 0;
   TotalDirs   := 0;
