@@ -55,7 +55,7 @@ uses
           ReadKey is replaced by a direct BIOS Int 16h call below. }
 
 const
-  PROG_VERSION   = '2.40-TP';
+  PROG_VERSION   = '2.50-TP';
   MAX_ENTRIES    = 2048; { Maximum number of files processed per directory }
   MAX_SUBDIRS    = 256;  { Maximum subdirectories tracked per level for /S }
   WIDE_COLS      = 5;    { Number of columns for Wide (/W) display format }
@@ -139,6 +139,7 @@ type
 var
   { Command Line Options }
   OptWide        : Boolean;  { /W switch }
+  Opt2Col        : Boolean;  { /2 switch: DR-DOS style two-column detail }
   OptPage        : Boolean;  { /P switch }
   OptBare        : Boolean;  { /B switch }
   OptLower       : Boolean;  { /L switch }
@@ -162,6 +163,10 @@ var
 
   TargetMask     : string;   { File wildcard to search for }
   TargetDir      : string;   { Base directory to search }
+  FirstHeader    : Boolean;  { True until the first 'Directory of' line is
+                               printed - keeps it snug under the volume
+                               header like real DIR, while /S puts a blank
+                               line before each subsequent directory }
 
   TotalFiles     : LongInt;  { Global statistics counters }
   TotalDirs      : LongInt;
@@ -890,6 +895,22 @@ end;
 { SORTING ENGINE                                                              }
 { =========================================================================== }
 
+{ Compares two LongInts as UNSIGNED 32-bit values. DOS packed timestamps
+  use bit 31 for years >= 2044, so a signed comparison would sort such
+  files (common on flash cards written with unset RTCs) before 1980. }
+function CmpUnsigned(A, B: LongInt): Integer;
+var
+  HA, HB: Word;
+begin
+  HA := Word(A shr 16);
+  HB := Word(B shr 16);
+  if HA < HB then CmpUnsigned := -1
+  else if HA > HB then CmpUnsigned := 1
+  else if Word(A) < Word(B) then CmpUnsigned := -1
+  else if Word(A) > Word(B) then CmpUnsigned := 1
+  else CmpUnsigned := 0;
+end;
+
 { Compares two file entries based on the currently selected SortKey }
 function CompareEntries(E1, E2: PFileEntry): Integer;
 var
@@ -937,10 +958,12 @@ begin
 
       SORT_DATE:
         begin
-          if E1^.Time < E2^.Time then ResultVal := -1
-          else if E1^.Time > E2^.Time then ResultVal := 1
-          else if E1^.Name < E2^.Name then ResultVal := -1
-          else if E1^.Name > E2^.Name then ResultVal := 1;
+          ResultVal := CmpUnsigned(E1^.Time, E2^.Time);
+          if ResultVal = 0 then
+          begin
+            if E1^.Name < E2^.Name then ResultVal := -1
+            else if E1^.Name > E2^.Name then ResultVal := 1;
+          end;
         end;
     end;
 
@@ -1040,6 +1063,56 @@ begin
     Exit;
   end;
 
+  { DR-DOS style /2: two detail columns separated by a box-draw bar.
+    Each half is exactly 38 chars; 38 + 3 (separator) + 38 = 79 cols. }
+  if Opt2Col then
+  begin
+    DotPos := Pos('.', OutName);
+    if (OutName = '.') or (OutName = '..') then
+    begin
+      BaseName := OutName;
+      ExtName := '';
+    end
+    else if DotPos > 0 then
+    begin
+      BaseName := Copy(OutName, 1, DotPos - 1);
+      ExtName  := Copy(OutName, DotPos + 1, 3);
+    end
+    else
+    begin
+      BaseName := OutName;
+      ExtName  := '';
+    end;
+
+    if (Entry.Attr and ATTR_DIRECTORY) <> 0 then
+      DisplayStr := PadLeft('<DIR>', 10)
+    else
+    begin
+      DisplayStr := FormatNumber(Entry.Size);
+      if Length(DisplayStr) > 10 then
+        Str(Entry.Size, DisplayStr); { > 99 MB: drop commas, keep column }
+      DisplayStr := PadLeft(DisplayStr, 10);
+    end;
+
+    FormatDateTime(Entry.Time, DateStr, TimeStr);
+    DisplayStr := PadRight(BaseName, 8) + ' ' + PadRight(ExtName, 3) +
+                  DisplayStr + ' ' + DateStr + ' ' + TimeStr;
+
+    if ColIndex = 0 then
+    begin
+      OutStr(DisplayStr, A);
+      OutStr(' '#179' ', CLR_NORMAL);  { CP437 179 = single vertical bar }
+      ColIndex := 1;
+    end
+    else
+    begin
+      OutLn(DisplayStr, A);
+      HandlePaging;
+      ColIndex := 0;
+    end;
+    Exit;
+  end;
+
   { Wide mode: Pack entries horizontally into columns }
   if OptWide then
   begin
@@ -1115,6 +1188,7 @@ var
   OnePassDirs     : Boolean;
   TempEntry       : TFileEntry;
   DotPos          : Integer;
+  DispPath        : PathStr79;
 begin
   { Ensure trailing backslash on path }
   if Path[Length(Path)] <> '\' then
@@ -1147,8 +1221,21 @@ begin
 
   if not OptBare then
   begin
-    PrintLine('');
-    PrintLine(' Directory of ' + Path);
+    { Real DIR prints the first 'Directory of' line directly under the
+      volume header; only subsequent directories (/S) get a separating
+      blank line }
+    if FirstHeader then
+      FirstHeader := False
+    else
+      PrintLine('');
+
+    { Real DIR shows the path without a trailing backslash - except the
+      root itself ('C:\'), which keeps it }
+    DispPath := Path;
+    if (Length(DispPath) > 3) and (DispPath[Length(DispPath)] = '\') then
+      Delete(DispPath, Length(DispPath), 1);
+
+    PrintLine(' Directory of ' + DispPath);
     PrintLine('');
   end;
 
@@ -1246,8 +1333,8 @@ begin
     Dispose(FileList);
   end;
 
-  { Flush uncompleted wide columns }
-  if OptWide and (ColIndex > 0) then
+  { Flush uncompleted wide / two-column rows }
+  if (OptWide or Opt2Col) and (ColIndex > 0) then
   begin
     OutLn('', CLR_NORMAL);
     HandlePaging;
@@ -1307,6 +1394,7 @@ begin
   WriteLn('Usage: FASTDIR [drive:][path][filename] [/W] [/P] [/B] [/L] [/S] [/Q] [/O:ord] [/A:att]');
   WriteLn;
   WriteLn('  /W          Wide format (5 columns across)');
+  WriteLn('  /2          Two-column detail format (DR-DOS style)');
   WriteLn('  /P          Pauses after each full screen of information');
   WriteLn('  /B          Bare format (no headers, bare filenames only)');
   WriteLn('  /L          Displays file names in lowercase');
@@ -1336,6 +1424,7 @@ begin
   if OptStr = '' then Exit;
 
   if (OptStr = 'W') then OptWide := True
+  else if (OptStr = '2') then Opt2Col := True
   else if (OptStr = 'P') then OptPage := True
   else if (OptStr = 'B') then OptBare := True
   else if (OptStr = 'L') then OptLower := True
@@ -1430,6 +1519,7 @@ var
 begin
   { Initialize Default State }
   OptWide       := False;
+  Opt2Col       := False;
   OptPage       := False;
   OptBare       := False;
   OptLower      := False;
@@ -1446,6 +1536,7 @@ begin
   AttrExclude   := ATTR_HIDDEN or ATTR_SYSTEM;
   TargetMask    := '';
   TargetDir     := '';
+  FirstHeader   := True;
 
   { Auto-detect BIOS text mode lines via BIOS data area (40:84 = rows-1) }
   LinesOnScreen := Mem[$0040:$0084] + 1;
