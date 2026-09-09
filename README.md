@@ -2,7 +2,7 @@
 <img width="636" height="238" alt="image" src="https://github.com/user-attachments/assets/815c3ee1-d115-4f32-8472-c2ce7b5e3b41" />
 
 
-**FastDir (v2.42)** is a high-performance, drop-in replacement for the standard `DIR` command in MS-DOS and PC-DOS.
+**FastDir (v2.50)** is a high-performance, drop-in replacement for the standard `DIR` command in MS-DOS and PC-DOS.
 
 It is tailored specifically for vintage and low-spec systems (8088/8086, 286, 386) connected to modern, large storage solutions such as CompactFlash cards, SD adapters, and XT-IDE controllers. Native DOS utilities often crawl or freeze on large FAT volumes; FastDir eliminates these bottlenecks through low-level hardware optimizations, intelligent free-space detection, and memory-conscious algorithms.
 
