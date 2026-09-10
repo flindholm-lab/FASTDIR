@@ -45,6 +45,8 @@ FASTDIR [drive:][path][filename] [/W] [/P] [/B] [/L] [/S] [/C] [/T] [/Q] [/QA] [
 | `/P` | **Pagination:** Pauses execution after each full screen of text until a key is pressed. |
 | `/B` | **Bare format:** Outputs plain file names only (suppresses headers, footers, and sizes). |
 | `/L` | **Lowercase:** Forces file and directory names to lowercase. |
+| `/H` | **Human Readable:** Show sizes in human readable format |
+| `/LFN` | **Long File Name:** Experimental support for LFN |
 | `/S` | **Subdirectories:** Recursively searches subfolders under the target directory. |
 | `/C` | **Color:** Highlights directories in yellow and executables in green. |
 | `/T` | **12-Hour Time:** Displays file timestamps in `HH:MMa/p` format (defaults to 24-hour). |
