@@ -39,6 +39,12 @@
 {   - /QA: quick approximate free space. Samples 8 FAT sectors via          }
 {     Int 25h and extrapolates instead of letting DOS walk the whole        }
 {     FAT (FAT16, DOS 4+). Falls back to exact scan when not applicable.    }
+{ v2.50:                                                                    }
+{   - /LFN (experimental): long filenames via the DOS LFN API              }
+{     (Int 21h 714Eh/4Fh/71A1h) - works under Win9x DOS, DOSLFN, NTVDM.    }
+{     Long names live in a per-directory bump-allocated string pool        }
+{     (12-byte-ish metadata records + contiguous name storage), display-   }
+{     capped; auto-falls back to 8.3 when no LFN provider is present.      }
 { =========================================================================== }
 
 {$A-,R-,S+,I-,Q-}      { Alignment off, range check off, STACK CHECK ON }
@@ -55,10 +61,20 @@ uses
           ReadKey is replaced by a direct BIOS Int 16h call below. }
 
 const
-  PROG_VERSION   = '2.53-TP';
+  PROG_VERSION   = '2.55-TP';
   MAX_ENTRIES    = 2048; { Maximum number of files processed per directory }
   MAX_SUBDIRS    = 256;  { Maximum subdirectories tracked per level for /S }
   WIDE_COLS      = 5;    { Number of columns for Wide (/W) display format }
+  LFN_WIDE_COLS  = 3;    { /W /LFN: fewer, wider columns for long names }
+  LFN_WIDE_WIDTH = 26;   { /W /LFN: column width (3 x 26 = 78 of 80) }
+
+  { /LFN long-name string pool: names are bump-allocated into one
+    contiguous block (reset per directory) instead of per-entry heap
+    blocks - zero fragmentation, O(1) allocation }
+  LFN_POOLSIZE   = 65520; { Largest single GetMem block in real mode }
+  LFN_MAXSTORE   = 63;    { Display cap: sorted mode stores at most this
+                            many chars per long name (a detail line can
+                            only show ~30 anyway) }
 
   { /C mode jump-scroll distance in lines. 1 = smoothest (line-by-line,
     like DOS), higher = fewer/cheaper scroll operations = less stutter
@@ -110,7 +126,13 @@ type
     Attr : Byte;
     Time : LongInt;
     Size : LongInt;
+    LOfs : Word;       { /LFN: offset of long name in LfnPool }
+    LLen : Byte;       { /LFN: length of long name (0 = none stored) }
   end;
+
+  { /LFN long-name pool (heap-allocated only when /LFN is active) }
+  TLfnPool = array[0..LFN_POOLSIZE - 1] of Char;
+  PLfnPool = ^TLfnPool;
 
   { Heap-allocated array to avoid hitting DSEG limitations in real mode }
   TFileArray = array[1..MAX_ENTRIES] of PFileEntry;
@@ -148,6 +170,14 @@ var
   OptEstimate    : Boolean;  { /QA switch: sampled free-space estimate }
   OptGroupDirs   : Boolean;  { /O:G switch (group directories first) }
   OptColor       : Boolean;  { /C switch }
+  OptHuman       : Boolean;  { /H switch: human-readable sizes (KB/MB/GB) }
+  OptLFN         : Boolean;  { /LFN switch (experimental long filenames) }
+  LfnActive      : Boolean;  { /LFN requested AND the LFN API responded }
+  LfnWarned      : Boolean;  { Fallback notice printed once }
+  LfnPool        : PLfnPool; { Long-name string pool (nil unless /LFN) }
+  PoolTop        : Word;     { Bump pointer into LfnPool }
+  CurLfn         : string;   { Long name of the entry being displayed }
+  LfnFindBuf     : array[0..317] of Byte; { 714Eh extended find buffer }
   OptAmPm        : Boolean;  { /T switch: 12-hour am/pm time (default 24h) }
   ColorActive    : Boolean;  { /C requested AND stdout is a real console }
 
@@ -176,6 +206,7 @@ var
     e.g. COUNTRY=046 (Sweden) uses space as thousands separator and
     yy-mm-dd dates }
   ThousandsSep   : Char;     { Separator for FormatNumber/FormatBig }
+  DecimalSep     : Char;     { Decimal separator for /H human sizes }
   DateSep        : Char;     { Date field separator }
   TimeSep        : Char;     { Time field separator }
   DateFmt        : Word;     { 0=mm dd yy (USA), 1=dd mm yy, 2=yy mm dd }
@@ -264,6 +295,7 @@ var
 begin
   { Safe US-style defaults if the call fails }
   ThousandsSep := ',';
+  DecimalSep   := '.';
   DateSep      := '-';
   TimeSep      := ':';
   DateFmt      := 0;
@@ -280,6 +312,7 @@ begin
     DateFmt := Buf[0] or (Word(Buf[1]) shl 8);
     if DateFmt > 2 then DateFmt := 0;
     if Buf[7]  <> 0 then ThousandsSep := Chr(Buf[7]);   { ofs 07h }
+    if Buf[9]  <> 0 then DecimalSep   := Chr(Buf[9]);   { ofs 09h }
     if Buf[11] <> 0 then DateSep      := Chr(Buf[11]);  { ofs 0Bh }
     if Buf[13] <> 0 then TimeSep      := Chr(Buf[13]);  { ofs 0Dh }
   end;
@@ -326,6 +359,71 @@ begin
   Str(Value:0:0, Raw);   { Comp printed via real syntax, 0 decimals }
 {$ENDIF}
   FormatBig := CommaFy(Raw);
+end;
+
+{ /H: renders a byte count as a human-readable size. Bytes below 1024
+  stay plain; one decimal below 10 units ('1,4 MB'), whole numbers above
+  ('156 MB'). Base 1024; the decimal separator follows COUNTRY=. }
+function HumanBig(V: Big): string;
+var
+  UnitVal    : Big;
+  UnitStr    : string[2];
+  Tenths     : LongInt;
+  Whole, Fr  : LongInt;
+  WStr, FStr : string[12];
+begin
+  if V < 1024 then
+  begin
+    HumanBig := FormatBig(V);
+    Exit;
+  end;
+
+  UnitVal := 1024;
+  UnitStr := 'KB';
+  if V >= UnitVal * 1024 then
+  begin
+    UnitVal := UnitVal * 1024;
+    UnitStr := 'MB';
+  end;
+  if V >= UnitVal * 1024 then
+  begin
+    UnitVal := UnitVal * 1024;
+    UnitStr := 'GB';
+  end;
+
+  { One division gives tenths of a unit; bounded by 10239 so it always
+    fits an Integer regardless of magnitude }
+  Tenths := Trunc((V * 10) / UnitVal);
+  Whole  := Tenths div 10;
+  Fr     := Tenths mod 10;
+
+  if Whole < 10 then
+  begin
+    Str(Whole, WStr);
+    Str(Fr, FStr);
+    HumanBig := WStr + DecimalSep + FStr + ' ' + UnitStr;
+  end
+  else
+    HumanBig := FormatNumber(Whole) + ' ' + UnitStr;
+end;
+
+{ /H helper for 32-bit file sizes }
+function HumanSize(V: LongInt): string;
+var
+  T: Big;
+begin
+  T := V;
+  HumanSize := HumanBig(T);
+end;
+
+{ Formats a byte count for the 17-wide summary/free-space fields:
+  human-readable with /H, exact grouped digits + ' bytes' otherwise }
+function FmtSize17(V: Big): string;
+begin
+  if OptHuman then
+    FmtSize17 := PadLeft(HumanBig(V), 17)
+  else
+    FmtSize17 := PadLeft(FormatBig(V), 17) + ' bytes';
 end;
 
 { Unpacks DOS date/time format and formats it into human-readable strings }
@@ -898,7 +996,7 @@ begin
         FreeBig := FAT32Data.AvailableClusters;
         FreeBig := FreeBig * ClusterBytes;
         PrintLine(PadLeft(FormatNumber(TotalDirs), 16) + ' Dir(s) ' +
-                  PadLeft(FormatBig(FreeBig), 17) + ' bytes free');
+                  FmtSize17(FreeBig) + ' free');
         Exit;
       end;
     end;
@@ -912,7 +1010,10 @@ begin
     begin
       if EstExact then
         PrintLine(PadLeft(FormatNumber(TotalDirs), 16) + ' Dir(s) ' +
-                  PadLeft(FormatBig(EstBytes), 17) + ' bytes free')
+                  FmtSize17(EstBytes) + ' free')
+      else if OptHuman then
+        PrintLine(PadLeft(FormatNumber(TotalDirs), 16) + ' Dir(s) ' +
+                  PadLeft('~' + HumanBig(EstBytes), 17) + ' free (est.)')
       else
         PrintLine(PadLeft(FormatNumber(TotalDirs), 16) + ' Dir(s) ' +
                   PadLeft('~' + FormatBig(EstBytes), 17) +
@@ -947,13 +1048,13 @@ begin
   begin
     { Under Windows NT/2000/XP the DOS box (NTVDM) caps AH=36h results,
       so the figure is a floor, not the real free space - say so }
+    FreeBig := BytesFree;
     if GetEnv('OS') = 'Windows_NT' then
       PrintLine(PadLeft(FormatNumber(TotalDirs), 16) + ' Dir(s) ' +
-                PadLeft(FormatNumber(BytesFree), 17) +
-                ' bytes free (NT cap)')
+                FmtSize17(FreeBig) + ' free (NT cap)')
     else
       PrintLine(PadLeft(FormatNumber(TotalDirs), 16) + ' Dir(s) ' +
-                PadLeft(FormatNumber(BytesFree), 17) + ' bytes free');
+                FmtSize17(FreeBig) + ' free');
   end
   else
     PrintLine(PadLeft(FormatNumber(TotalDirs), 16) +
@@ -1073,6 +1174,131 @@ begin
 end;
 
 { =========================================================================== }
+{ LONG FILENAME (LFN) API SUPPORT - Int 21h 71xxh (experimental /LFN)         }
+{ Available under Win9x DOS, DOSLFN on plain DOS, and Windows NT/XP NTVDM.    }
+{ SI=1 requests DOS-format timestamps so no FILETIME conversion is needed.    }
+{ =========================================================================== }
+
+{ Opens an LFN search. Detection is triple-layered because real DOS
+  returns AL=0 for unknown 71h functions with the CARRY FLAG UNDEFINED:
+  (1) AX=$7100 means "unsupported" regardless of carry state,
+  (2) the find buffer is sentinel-filled first and genuine success must
+      have overwritten it (a real attribute dword never reads FFFFFFFFh),
+  (3) carry set with any other code is an ordinary empty-search error. }
+function LfnFindFirst(const Mask: string; var Handle: Word): Boolean;
+var
+  Regs : Registers;
+  Spec : string[96];
+begin
+  LfnFindFirst := False;
+  Spec := Mask + #0;
+  FillChar(LfnFindBuf, SizeOf(LfnFindBuf), $FF);  { sentinel }
+  FillChar(Regs, SizeOf(Regs), 0);
+  Regs.AX := $714E;              { LFN FindFirst }
+  Regs.CX := ATTR_ANYFILE;       { CL=allowable attrs, CH=required=0 }
+  Regs.SI := 1;                  { Return DOS date/time format }
+  Regs.DS := Seg(Spec[1]);
+  Regs.DX := Ofs(Spec[1]);
+  Regs.ES := Seg(LfnFindBuf);
+  Regs.DI := Ofs(LfnFindBuf);
+  Regs.Flags := FCarry;
+  Intr($21, Regs);
+
+  { Unsupported kernel: AX=$7100 in ANY flag state, or the buffer was
+    never written despite an apparent success }
+  if (Regs.AX = $7100) or
+     (((Regs.Flags and FCarry) = 0) and
+      (LfnFindBuf[0] = $FF) and (LfnFindBuf[1] = $FF) and
+      (LfnFindBuf[2] = $FF) and (LfnFindBuf[3] = $FF)) then
+  begin
+    LfnActive := False;
+    if not LfnWarned then
+    begin
+      PrintLine(' [LFN API not available - showing 8.3 names]');
+      LfnWarned := True;
+    end;
+    Exit;
+  end;
+
+  if (Regs.Flags and FCarry) = 0 then
+  begin
+    Handle := Regs.AX;
+    LfnFindFirst := True;
+  end;
+  { Carry set with another code: ordinary empty search - stay quiet }
+end;
+
+function LfnFindNext(Handle: Word): Boolean;
+var
+  Regs: Registers;
+begin
+  FillChar(LfnFindBuf, SizeOf(LfnFindBuf), $FF);  { sentinel }
+  FillChar(Regs, SizeOf(Regs), 0);
+  Regs.AX := $714F;
+  Regs.BX := Handle;
+  Regs.SI := 1;
+  Regs.ES := Seg(LfnFindBuf);
+  Regs.DI := Ofs(LfnFindBuf);
+  Regs.Flags := FCarry;
+  Intr($21, Regs);
+  { Success requires: carry clear, not the "unsupported" code, and the
+    kernel really wrote the buffer - all three guard against real DOS
+    leaving carry undefined on unknown functions }
+  LfnFindNext := ((Regs.Flags and FCarry) = 0) and
+                 (Regs.AX <> $7100) and
+                 not ((LfnFindBuf[0] = $FF) and (LfnFindBuf[1] = $FF) and
+                      (LfnFindBuf[2] = $FF) and (LfnFindBuf[3] = $FF));
+end;
+
+{ LFN search handles are a finite kernel resource - always close them }
+procedure LfnFindClose(Handle: Word);
+var
+  Regs: Registers;
+begin
+  FillChar(Regs, SizeOf(Regs), 0);
+  Regs.AX := $71A1;
+  Regs.BX := Handle;
+  Intr($21, Regs);
+end;
+
+{ Unpacks the 714Eh find buffer: attribute dword at 00h, DOS-format
+  last-write time dword at 14h, size dword at 20h, long name ASCIIZ at
+  2Ch, alternate 8.3 name ASCIIZ at 130h (empty when the long name IS
+  already a valid 8.3 name). }
+procedure LfnExtract(var E: TFileEntry; var LongName: string);
+var
+  I  : Integer;
+  SN : string[13];
+begin
+  E.Attr := LfnFindBuf[0];
+  Move(LfnFindBuf[$14], E.Time, 4);
+  Move(LfnFindBuf[$20], E.Size, 4);
+  E.LOfs := 0;
+  E.LLen := 0;
+
+  I := 0;
+  while (I < 255) and (LfnFindBuf[$2C + I] <> 0) do
+  begin
+    LongName[I + 1] := Chr(LfnFindBuf[$2C + I]);
+    Inc(I);
+  end;
+  LongName[0] := Chr(I);
+
+  I := 0;
+  while (I < 12) and (LfnFindBuf[$130 + I] <> 0) do
+  begin
+    SN[I + 1] := Chr(LfnFindBuf[$130 + I]);
+    Inc(I);
+  end;
+  SN[0] := Chr(I);
+
+  if SN <> '' then
+    E.Name := SN
+  else
+    E.Name := ToUpperStr(Copy(LongName, 1, 12));
+end;
+
+{ =========================================================================== }
 { DIRECTORY PROCESSING                                                        }
 { =========================================================================== }
 
@@ -1119,12 +1345,20 @@ begin
   if OptLower then
     OutName := ToLowerStr(OutName);
 
-  { Bare mode: Only print the filename, ignoring stats }
+  { Bare mode: Only print the filename, ignoring stats. With /LFN the
+    full long name is printed (case preserved, no /L lowering). }
   if OptBare then
   begin
     if (Entry.Name <> '.') and (Entry.Name <> '..') then
     begin
-      if OptSubDir then
+      if OptLFN and (CurLfn <> '') then
+      begin
+        if OptSubDir then
+          PrintLineC(CurrentPath + CurLfn, A)
+        else
+          PrintLineC(CurLfn, A);
+      end
+      else if OptSubDir then
         PrintLineC(CurrentPath + OutName, A)
       else
         PrintLineC(OutName, A);
@@ -1155,6 +1389,8 @@ begin
 
     if (Entry.Attr and ATTR_DIRECTORY) <> 0 then
       DisplayStr := PadLeft('<DIR>', 10)
+    else if OptHuman then
+      DisplayStr := PadLeft(HumanSize(Entry.Size), 10)  { max 9 chars }
     else
     begin
       DisplayStr := FormatNumber(Entry.Size);
@@ -1182,21 +1418,45 @@ begin
     Exit;
   end;
 
-  { Wide mode: Pack entries horizontally into columns }
+  { Wide mode: Pack entries horizontally into columns. With /LFN active,
+    3 wider columns (26 chars) replace the classic 5x15 so long names
+    fit; names over the cap are truncated with a '>>' marker (CP437 175). }
   if OptWide then
   begin
-    if (Entry.Attr and ATTR_DIRECTORY) <> 0 then
-      DisplayStr := '[' + OutName + ']'
+    if LfnActive and (CurLfn <> '') then
+      DisplayStr := CurLfn
     else
       DisplayStr := OutName;
 
-    OutStr(PadRight(DisplayStr, 15), A);
-    Inc(ColIndex);
-    if ColIndex >= WIDE_COLS then
+    if (Entry.Attr and ATTR_DIRECTORY) <> 0 then
+      DisplayStr := '[' + DisplayStr + ']';
+
+    if LfnActive then
     begin
-      OutLn('', CLR_NORMAL);
-      HandlePaging;
-      ColIndex := 0;
+      if Length(DisplayStr) >= LFN_WIDE_WIDTH then
+      begin
+        DisplayStr[0] := Chr(LFN_WIDE_WIDTH - 1);   { hard cap }
+        DisplayStr[LFN_WIDE_WIDTH - 1] := #175;     { truncation marker }
+      end;
+      OutStr(PadRight(DisplayStr, LFN_WIDE_WIDTH), A);
+      Inc(ColIndex);
+      if ColIndex >= LFN_WIDE_COLS then
+      begin
+        OutLn('', CLR_NORMAL);
+        HandlePaging;
+        ColIndex := 0;
+      end;
+    end
+    else
+    begin
+      OutStr(PadRight(DisplayStr, 15), A);
+      Inc(ColIndex);
+      if ColIndex >= WIDE_COLS then
+      begin
+        OutLn('', CLR_NORMAL);
+        HandlePaging;
+        ColIndex := 0;
+      end;
     end;
     Exit;
   end;
@@ -1228,12 +1488,27 @@ begin
     columns always line up. }
   if (Entry.Attr and ATTR_DIRECTORY) <> 0 then
     DisplayStr := DisplayStr + PadRight('   <DIR>', 14) + ' '
+  else if OptHuman then
+    DisplayStr := DisplayStr + PadLeft(HumanSize(Entry.Size), 14) + ' '
   else
     DisplayStr := DisplayStr + PadLeft(FormatNumber(Entry.Size), 14) + ' ';
 
   { Append Dates and Times }
   FormatDateTime(Entry.Time, DateStr, TimeStr);
   DisplayStr := DisplayStr + DateStr + '  ' + TimeStr;
+
+  { /LFN: append the long name after the time column (Win9x DIR style),
+    truncated to the 79-column line. Comparison is case-sensitive, so a
+    name differing only in case (e.g. 'Command.com') is still shown -
+    preserved case is the point - while an identical uppercase 8.3 name
+    is suppressed as redundant. }
+  if OptLFN and (CurLfn <> '') and (CurLfn <> Entry.Name) then
+  begin
+    DisplayStr := DisplayStr + ' ';
+    DotPos := 79 - Length(DisplayStr);  { reuse: remaining columns }
+    if DotPos > 0 then
+      DisplayStr := DisplayStr + Copy(CurLfn, 1, DotPos);
+  end;
 
   PrintLineC(DisplayStr, A);
 end;
@@ -1258,6 +1533,100 @@ var
   TempEntry       : TFileEntry;
   DotPos          : Integer;
   DispPath        : PathStr79;
+  LHandle         : Word;
+  LName           : string;
+
+  { Shared per-entry logic for both the classic (FindFirst) and LFN
+    (714Eh) enumeration loops: /S collection, filtering, statistics,
+    and streaming display or storage. ELong is '' in classic mode. }
+  procedure ProcessEntry(const EName: string; EAttr: Byte;
+                         ETime, ESize: LongInt; const ELong: string);
+  var
+    L: Integer;
+  begin
+    { Collect subdirectories for /S recursion - independent of the
+      display filter, and always via the SHORT name so recursion paths
+      stay within DOS path limits and open on any kernel }
+    if OnePassDirs and
+       ((EAttr and ATTR_DIRECTORY) <> 0) and
+       ((EAttr and (ATTR_HIDDEN or ATTR_SYSTEM)) = 0) and
+       (EName <> '.') and (EName <> '..') and
+       (SubDirCount < MAX_SUBDIRS) then
+    begin
+      Inc(SubDirCount);
+      SubDirList^[SubDirCount] := EName;
+    end;
+
+    { Validate Attributes before keeping the entry }
+    if ((EAttr and ATTR_VOLUME) = 0) and
+       ((EAttr and AttrRequire) = AttrRequire) and
+       ((EAttr and AttrExclude) = 0) then
+    begin
+      if (EAttr and ATTR_DIRECTORY) <> 0 then
+      begin
+        Inc(TotalDirs);
+      end
+      else
+      begin
+        Inc(DirFiles);
+        DirBytes := DirBytes + ESize;
+        Inc(TotalFiles);
+        TotalBytes := TotalBytes + ESize;
+      end;
+
+      if Streaming then
+      begin
+        TempEntry.Name := EName;
+        TempEntry.Attr := EAttr;
+        TempEntry.Time := ETime;
+        TempEntry.Size := ESize;
+        CurLfn := ELong;
+        DisplayEntry(TempEntry, Path);
+      end
+      else if Count < MAX_ENTRIES then
+      begin
+        Inc(Count);
+        New(FileList^[Count]);
+        FileList^[Count]^.Name := EName;
+        FileList^[Count]^.Attr := EAttr;
+        FileList^[Count]^.Time := ETime;
+        FileList^[Count]^.Size := ESize;
+        FileList^[Count]^.LOfs := 0;
+        FileList^[Count]^.LLen := 0;
+
+        { Bump-allocate the long name into the pool (display-capped);
+          if the pool fills, remaining entries just show 8.3 }
+        if OptLFN and (ELong <> '') and (LfnPool <> nil) then
+        begin
+          L := Length(ELong);
+          if L > LFN_MAXSTORE then L := LFN_MAXSTORE;
+          if LongInt(PoolTop) + L <= LFN_POOLSIZE then
+          begin
+            Move(ELong[1], LfnPool^[PoolTop], L);
+            FileList^[Count]^.LOfs := PoolTop;
+            FileList^[Count]^.LLen := L;
+            Inc(PoolTop, L);
+          end;
+        end;
+
+        { Precompute the extension once for /O:E so the quicksort
+          comparator doesn't repeat Pos+Copy on every comparison }
+        if SortKey = SORT_EXT then
+        begin
+          DotPos := Pos('.', EName);
+          if DotPos > 0 then
+            FileList^[Count]^.Ext := Copy(EName, DotPos, 4)
+          else
+            FileList^[Count]^.Ext := '';
+        end
+        else
+          FileList^[Count]^.Ext := '';
+      end
+      else
+        Truncated := True;
+    end;
+  end;
+
 begin
   { Ensure trailing backslash on path }
   if Path[Length(Path)] <> '\' then
@@ -1313,79 +1682,42 @@ begin
   if not Streaming then
     New(FileList);
 
-  FindFirst(FullPathPattern, ATTR_ANYFILE, SearchObj);
-  while DosError = 0 do
+  PoolTop := 0;  { Long-name pool resets per directory }
+
+  { --- LFN enumeration (714Eh) --- }
+  if LfnActive then
   begin
-    { Collect subdirectories for /S recursion. This is deliberately
-      independent of the display filter (/A) - matching the behavior of
-      the old separate scan, which skipped hidden/system directories. }
-    if OnePassDirs and
-       ((SearchObj.Attr and ATTR_DIRECTORY) <> 0) and
-       ((SearchObj.Attr and (ATTR_HIDDEN or ATTR_SYSTEM)) = 0) and
-       (SearchObj.Name <> '.') and (SearchObj.Name <> '..') and
-       (SubDirCount < MAX_SUBDIRS) then
+    if LfnFindFirst(FullPathPattern, LHandle) then
     begin
-      Inc(SubDirCount);
-      SubDirList^[SubDirCount] := SearchObj.Name;
+      repeat
+        LfnExtract(TempEntry, LName);
+        { Safety net: an entry with neither a short nor a long name can
+          only come from a kernel feeding us garbage - stop immediately
+          rather than scroll blanks forever }
+        if (TempEntry.Name = '') and (LName = '') then Break;
+        ProcessEntry(TempEntry.Name, TempEntry.Attr,
+                     TempEntry.Time, TempEntry.Size, LName);
+      until not LfnFindNext(LHandle);
+      LfnFindClose(LHandle);
     end;
-
-    { Validate Attributes before keeping the entry }
-    if ((SearchObj.Attr and ATTR_VOLUME) = 0) and
-       ((SearchObj.Attr and AttrRequire) = AttrRequire) and
-       ((SearchObj.Attr and AttrExclude) = 0) then
-    begin
-      { Update statistics }
-      if (SearchObj.Attr and ATTR_DIRECTORY) <> 0 then
-      begin
-        Inc(TotalDirs);
-      end
-      else
-      begin
-        Inc(DirFiles);
-        DirBytes := DirBytes + SearchObj.Size;
-        Inc(TotalFiles);
-        TotalBytes := TotalBytes + SearchObj.Size;
-      end;
-
-      if Streaming then
-      begin
-        { Print immediately - no storage, no entry limit }
-        TempEntry.Name := SearchObj.Name;
-        TempEntry.Attr := SearchObj.Attr;
-        TempEntry.Time := SearchObj.Time;
-        TempEntry.Size := SearchObj.Size;
-        DisplayEntry(TempEntry, Path);
-      end
-      else if Count < MAX_ENTRIES then
-      begin
-        Inc(Count);
-        New(FileList^[Count]);
-        FileList^[Count]^.Name := SearchObj.Name;
-        FileList^[Count]^.Attr := SearchObj.Attr;
-        FileList^[Count]^.Time := SearchObj.Time;
-        FileList^[Count]^.Size := SearchObj.Size;
-
-        { Precompute the extension once for /O:E so the quicksort
-          comparator doesn't repeat Pos+Copy on every comparison }
-        if SortKey = SORT_EXT then
-        begin
-          DotPos := Pos('.', SearchObj.Name);
-          if DotPos > 0 then
-            FileList^[Count]^.Ext := Copy(SearchObj.Name, DotPos, 4)
-          else
-            FileList^[Count]^.Ext := '';
-        end
-        else
-          FileList^[Count]^.Ext := '';
-      end
-      else
-        Truncated := True;
-    end;
-    FindNext(SearchObj);
+    { If the API turned out to be absent, LfnActive is now False and
+      the classic loop below takes over seamlessly }
   end;
+
+  { --- Classic enumeration (FindFirst/FindNext) --- }
+  if not LfnActive then
+  begin
+    FindFirst(FullPathPattern, ATTR_ANYFILE, SearchObj);
+    while DosError = 0 do
+    begin
+      ProcessEntry(SearchObj.Name, SearchObj.Attr,
+                   SearchObj.Time, SearchObj.Size, '');
+      FindNext(SearchObj);
+    end;
 {$IFDEF FPC}
-  FindClose(SearchObj);
+    FindClose(SearchObj);
 {$ENDIF}
+  end;
 
   if not Streaming then
   begin
@@ -1396,6 +1728,12 @@ begin
     { Display the sorted entries & clean up memory }
     for I := 1 to Count do
     begin
+      CurLfn := '';
+      if OptLFN and (FileList^[I]^.LLen > 0) and (LfnPool <> nil) then
+      begin
+        CurLfn[0] := Chr(FileList^[I]^.LLen);
+        Move(LfnPool^[FileList^[I]^.LOfs], CurLfn[1], FileList^[I]^.LLen);
+      end;
       DisplayEntry(FileList^[I]^, Path);
       Dispose(FileList^[I]);
     end;
@@ -1417,7 +1755,7 @@ begin
   if not OptBare then
   begin
     PrintLine(PadLeft(FormatNumber(DirFiles), 16) + ' File(s) ' +
-              PadLeft(FormatBig(DirBytes), 17) + ' bytes');
+              FmtSize17(DirBytes));
   end;
 
   { Handle /S Subdirectory recursion mode }
@@ -1469,6 +1807,8 @@ begin
   WriteLn('  /L          Displays file names in lowercase');
   WriteLn('  /S          Recursively searches all subdirectories');
   WriteLn('  /C          Color: directories yellow, .COM/.EXE/.BAT green');
+  WriteLn('  /LFN        Experimental: long filenames (Win9x DOS/DOSLFN/NTVDM)');
+  WriteLn('  /H          Human-readable sizes (KB, MB, GB)');
   WriteLn('  /T          12-hour am/pm time display (default is 24-hour)');
   WriteLn('  /Q or /-F   Quick mode: bypasses slow free-space calculation');
   WriteLn('  /QA         Quick approx. free space (samples the FAT, FAT16/DOS4+)');
@@ -1499,6 +1839,8 @@ begin
   else if (OptStr = 'L') then OptLower := True
   else if (OptStr = 'S') then OptSubDir := True
   else if (OptStr = 'C') then OptColor := True
+  else if (OptStr = 'H') then OptHuman := True
+  else if (OptStr = 'LFN') then OptLFN := True
   else if (OptStr = 'T') then OptAmPm := True
   else if (OptStr = 'Q') or (OptStr = '-F') then OptSkipFree := True
   else if (OptStr = 'QA') then OptEstimate := True
@@ -1597,6 +1939,8 @@ begin
   OptEstimate   := False;
   OptGroupDirs  := False;
   OptColor      := False;
+  OptHuman      := False;
+  OptLFN        := False;
   OptAmPm       := False;
   ColorActive   := False;
   SortKey       := SORT_NONE;
@@ -1713,6 +2057,16 @@ begin
     redirected output (files, pipes) stays plain automatically }
   ColorActive := OptColor and StdOutIsConsole;
 
+  { /LFN: activate the LFN path (self-disables on the first call if the
+    API is absent) and allocate the long-name pool }
+  LfnActive := OptLFN;
+  LfnWarned := False;
+  LfnPool   := nil;
+  PoolTop   := 0;
+  CurLfn    := '';
+  if OptLFN then
+    GetMem(LfnPool, LFN_POOLSIZE);
+
   { Determine Target Drive for Status Checks }
   if (Length(TargetDir) >= 2) and (TargetDir[2] = ':') then
     DriveChar := TargetDir[1]
@@ -1740,7 +2094,7 @@ begin
     PrintLine('');
     PrintLine('     Total Files Listed:');
     PrintLine(PadLeft(FormatNumber(TotalFiles), 16) + ' File(s) ' +
-              PadLeft(FormatBig(TotalBytes), 17) + ' bytes');
+              FmtSize17(TotalBytes));
   end;
 
   { 4. Print Footer }
