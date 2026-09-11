@@ -39,7 +39,7 @@
 {   - /QA: quick approximate free space. Samples 8 FAT sectors via          }
 {     Int 25h and extrapolates instead of letting DOS walk the whole        }
 {     FAT (FAT16, DOS 4+). Falls back to exact scan when not applicable.    }
-{ v2.50:                                                                    }
+{ v2.60:                                                                    }
 {   - /LFN (experimental): long filenames via the DOS LFN API              }
 {     (Int 21h 714Eh/4Fh/71A1h) - works under Win9x DOS, DOSLFN, NTVDM.    }
 {     Long names live in a per-directory bump-allocated string pool        }
@@ -61,7 +61,7 @@ uses
           ReadKey is replaced by a direct BIOS Int 16h call below. }
 
 const
-  PROG_VERSION   = '2.55-TP';
+  PROG_VERSION   = '2.58-TP';
   MAX_ENTRIES    = 2048; { Maximum number of files processed per directory }
   MAX_SUBDIRS    = 256;  { Maximum subdirectories tracked per level for /S }
   WIDE_COLS      = 5;    { Number of columns for Wide (/W) display format }
@@ -178,7 +178,8 @@ var
   PoolTop        : Word;     { Bump pointer into LfnPool }
   CurLfn         : string;   { Long name of the entry being displayed }
   LfnFindBuf     : array[0..317] of Byte; { 714Eh extended find buffer }
-  OptAmPm        : Boolean;  { /T switch: 12-hour am/pm time (default 24h) }
+  OptAmPm        : Boolean;  { 12-hour am/pm time: default from COUNTRY=
+                               time format byte, /T inverts the default }
   ColorActive    : Boolean;  { /C requested AND stdout is a real console }
 
   SortKey        : Byte;     { Active sorting mechanism }
@@ -286,19 +287,22 @@ end;
 { =========================================================================== }
 
 { Reads the active DOS country information (Int 21h AH=38h) and captures
-  the thousands separator, date/time separators and date field order,
-  so numbers and dates match what real DIR prints under any COUNTRY= }
+  the thousands/decimal separators, date/time separators, date field
+  order, and the 12/24-hour clock preference, so output matches what
+  real DIR prints under any COUNTRY= }
 procedure InitCountry;
 var
   Regs : Registers;
   Buf  : array[0..33] of Byte;
 begin
-  { Safe US-style defaults if the call fails }
+  { Safe US-style defaults if the call fails (24-hour clock kept as the
+    program default; /T can still force am/pm) }
   ThousandsSep := ',';
   DecimalSep   := '.';
   DateSep      := '-';
   TimeSep      := ':';
   DateFmt      := 0;
+  OptAmPm      := False;
 
   FillChar(Regs, SizeOf(Regs), 0);
   FillChar(Buf, SizeOf(Buf), 0);
@@ -315,6 +319,9 @@ begin
     if Buf[9]  <> 0 then DecimalSep   := Chr(Buf[9]);   { ofs 09h }
     if Buf[11] <> 0 then DateSep      := Chr(Buf[11]);  { ofs 0Bh }
     if Buf[13] <> 0 then TimeSep      := Chr(Buf[13]);  { ofs 0Dh }
+    { ofs 11h: time format, bit 0 = 0 -> 12-hour, 1 -> 24-hour.
+      This sets the DEFAULT; the /T switch (parsed later) overrides. }
+    OptAmPm := (Buf[17] and 1) = 0;
   end;
 end;
 
@@ -844,8 +851,11 @@ begin
   EstimateFreeSpace := False;
   Exact := False;
 
-  { Packet-method Int 25h needs DOS 4.0+ }
-  if Lo(DosVersion) < 4 then Exit;
+  { Packet-method Int 25h (32-bit sector, CX=FFFFh) exists since
+    Compaq DOS 3.31 - the release that introduced >32 MB partitions -
+    not just 4.0. Reject strictly below 3.31: }
+  if (Lo(DosVersion) < 3) or
+     ((Lo(DosVersion) = 3) and (Hi(DosVersion) < 31)) then Exit;
 
   { Read the boot sector and pull the BPB apart }
   if not AbsDiskRead(DriveNum - 1, 0, Seg(EstBuf), Ofs(EstBuf)) then Exit;
@@ -1809,7 +1819,7 @@ begin
   WriteLn('  /C          Color: directories yellow, .COM/.EXE/.BAT green');
   WriteLn('  /LFN        Experimental: long filenames (Win9x DOS/DOSLFN/NTVDM)');
   WriteLn('  /H          Human-readable sizes (KB, MB, GB)');
-  WriteLn('  /T          12-hour am/pm time display (default is 24-hour)');
+  WriteLn('  /T          Toggle 12/24-hour time (inverts the COUNTRY= default)');
   WriteLn('  /Q or /-F   Quick mode: bypasses slow free-space calculation');
   WriteLn('  /QA         Quick approx. free space (samples the FAT, FAT16/DOS4+)');
   WriteLn('  /O:order    Sort order: N(name), E(ext), S(size), D(date), G(group dirs)');
@@ -1841,7 +1851,7 @@ begin
   else if (OptStr = 'C') then OptColor := True
   else if (OptStr = 'H') then OptHuman := True
   else if (OptStr = 'LFN') then OptLFN := True
-  else if (OptStr = 'T') then OptAmPm := True
+  else if (OptStr = 'T') then OptAmPm := not OptAmPm  { invert country default }
   else if (OptStr = 'Q') or (OptStr = '-F') then OptSkipFree := True
   else if (OptStr = 'QA') then OptEstimate := True
   else if (OptStr = '?') then ShowHelp
@@ -1941,7 +1951,8 @@ begin
   OptColor      := False;
   OptHuman      := False;
   OptLFN        := False;
-  OptAmPm       := False;
+  { OptAmPm deliberately NOT reset here: InitCountry (which runs first)
+    set its default from the COUNTRY= time format; /T overrides it }
   ColorActive   := False;
   SortKey       := SORT_NONE;
   SortReverse   := False;
@@ -1995,9 +2006,12 @@ begin
   begin
     if TargetMask[Length(TargetMask)] in ['\', ':'] then
       TargetMask := TargetMask + '*.*'
-    else
+    else if (Pos('*', TargetMask) = 0) and (Pos('?', TargetMask) = 0) then
     begin
-      { If the argument names an existing directory, list its contents }
+      { A LITERAL argument naming an existing directory lists its
+        contents. This check must never run on wildcard masks: with
+        'T*', FindFirst would match some T-something directory and
+        wrongly rewrite the mask to 'T*\*.*' (zero matches). }
       FindFirst(TargetMask, ATTR_DIRECTORY, CheckSR);
       if (DosError = 0) and ((CheckSR.Attr and ATTR_DIRECTORY) <> 0) then
         TargetMask := TargetMask + '\*.*';
@@ -2027,6 +2041,15 @@ begin
   end;
 
   if TargetMask = '' then TargetMask := '*.*';
+
+  { DIR semantics: a mask with no extension matches ANY extension.
+    Kernel FindFirst treats 'T*' as "T-anything with a BLANK extension"
+    (the same 8.3 rule behind the classic 'del *' vs 'del *.*' gotcha),
+    so like real DIR we append '.*' - 'T*' -> 'T*.*', 'COMMAND' ->
+    'COMMAND.*'. Extensionless names still match, since a blank
+    extension satisfies '*'. }
+  if Pos('.', TargetMask) = 0 then
+    TargetMask := TargetMask + '.*';
 end;
 
 { =========================================================================== }
