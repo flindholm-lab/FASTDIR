@@ -39,7 +39,7 @@
 {   - /QA: quick approximate free space. Samples 8 FAT sectors via          }
 {     Int 25h and extrapolates instead of letting DOS walk the whole        }
 {     FAT (FAT16, DOS 4+). Falls back to exact scan when not applicable.    }
-{ v2.60:                                                                    }
+{ v2.50:                                                                    }
 {   - /LFN (experimental): long filenames via the DOS LFN API              }
 {     (Int 21h 714Eh/4Fh/71A1h) - works under Win9x DOS, DOSLFN, NTVDM.    }
 {     Long names live in a per-directory bump-allocated string pool        }
