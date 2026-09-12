@@ -43,8 +43,34 @@
 {   - /LFN (experimental): long filenames via the DOS LFN API              }
 {     (Int 21h 714Eh/4Fh/71A1h) - works under Win9x DOS, DOSLFN, NTVDM.    }
 {     Long names live in a per-directory bump-allocated string pool        }
-{     (12-byte-ish metadata records + contiguous name storage), display-   }
-{     capped; auto-falls back to 8.3 when no LFN provider is present.      }
+{     (fixed metadata records + contiguous name storage), display-capped;  }
+{     auto-falls back to 8.3 when no LFN provider is present. Wide mode    }
+{     switches to 3x26 columns with truncation markers under /LFN.         }
+{   - /2 two-column detail format (DR-DOS style), /H human-readable        }
+{     sizes, /T inverts the COUNTRY= 12/24-hour clock default              }
+{   - COUNTRY=-aware output: thousands/decimal separators, date order      }
+{     and separators, clock format - matching real DIR everywhere          }
+{   - DIR-compatible mask semantics: 'T*' -> 'T*.*', literal directory     }
+{     names list contents, wildcards never trigger the directory check     }
+{ v2.60:                                                                    }
+{   - /C now color-codes by file type via a packed-integer extension       }
+{     table (90 extensions): executables green, archives & disk images     }
+{     light red, documents/configs light cyan, media light blue, source    }
+{     code bright white, backups/temp dark gray (auto-remapped to normal   }
+{     on MDA/Hercules where dark gray is invisible)                        }
+{   - 8088 tuning: running video offset in OutStr (no per-character MUL,   }
+{     BDA cursor read), single contiguous entry pool instead of 2048       }
+{     New() calls, single-pass thousands-separator formatting, LongRec     }
+{     word access replacing 32-bit shifts in the sort comparator           }
+{ v2.70 - color-mode rendering core rewritten for the 4.77 MHz 8088:       }
+{   - CRTC hardware scrolling: the visible window slides through the       }
+{     16 KB VRAM ring via the 6845 start-address register - zero-copy,     }
+{     smooth 1-line scrolls; ring rewind only every ~77 lines. Screen,     }
+{     BDA and cursor restored on exit via an ExitProc (crash-safe).        }
+{   - LODSB/STOSW run blitter replaces the per-character write loop;       }
+{     REP STOSW blank fills; hardware cursor synced only at /P pauses      }
+{     and program exit instead of per string (no Int 10h in the hot path)  }
+{   - MDA keeps software jump scroll (4 KB VRAM); FPC keeps BIOS paths     }
 { =========================================================================== }
 
 {$A-,R-,S+,I-,Q-}      { Alignment off, range check off, STACK CHECK ON }
@@ -61,7 +87,7 @@ uses
           ReadKey is replaced by a direct BIOS Int 16h call below. }
 
 const
-  PROG_VERSION   = '2.58-TP';
+  PROG_VERSION   = '2.70-TP';
   MAX_ENTRIES    = 2048; { Maximum number of files processed per directory }
   MAX_SUBDIRS    = 256;  { Maximum subdirectories tracked per level for /S }
   WIDE_COLS      = 5;    { Number of columns for Wide (/W) display format }
@@ -76,18 +102,32 @@ const
                             many chars per long name (a detail line can
                             only show ~30 anyway) }
 
-  { /C mode jump-scroll distance in lines. 1 = smoothest (line-by-line,
-    like DOS), higher = fewer/cheaper scroll operations = less stutter
-    on slow machines. 4 is a good balance on XT-class hardware. }
+  { Software jump-scroll distance in lines - used only where hardware
+    CRTC scrolling is unavailable (MDA/Hercules, FPC builds). On color
+    adapters /C scrolls via the CRTC start address: zero-copy, smooth,
+    one line at a time. }
   SCROLL_STEP    = 4;
+
+  { Text VRAM ring for CRTC hardware scrolling: CGA has 16 KB at B800h,
+    enough for 102 lines of 80-column text. The visible window slides
+    through it; a rare block copy back to offset 0 happens only when
+    the window would cross the 16 KB wrap (once per ~77 scrolled lines). }
+  RING_BYTES     = $4000;
 
   { /QA: number of FAT sectors sampled for the free-space estimate }
   EST_SAMPLES    = 8;
 
   { Text attributes for /C color mode (foreground on black) }
   CLR_NORMAL     = $07;  { Light gray - ordinary files & framework text }
-  CLR_DIR        = $0E;  { Yellow     - directories }
-  CLR_EXEC       = $0A;  { Light green- .COM / .EXE / .BAT }
+  CLR_DIR        = $0E;  { Yellow      - directories }
+  CLR_EXEC       = $0A;  { Light green - .COM / .EXE / .BAT }
+  CLR_ARCH       = $0C;  { Light red   - archives & disk images }
+  CLR_DOCS       = $0B;  { Light cyan  - documents, text, configs }
+  CLR_MEDIA      = $09;  { Light blue  - images, audio, music, video }
+  CLR_SRC        = $0F;  { Bright white- source code }
+  CLR_JUNK       = $08;  { Dark gray   - backups/temp (normal on mono) }
+
+  EXT_TABLE_MAX  = 96;   { Capacity of the extension color table }
 
   { Standard DOS File Attributes }
   ATTR_READONLY  = $01;
@@ -118,6 +158,20 @@ type
   PathStr12 = string[12];
   PathStr79 = string[79];
 
+  { Word-level view of a LongInt: the 8088 has no barrel shifter, so
+    'shr 16' costs a 16-iteration shift loop - direct word access is free }
+  LongRec = record
+    Lo, Hi: Word;
+  end;
+
+  { One extension-color rule: the (uppercase) extension packed into a
+    LongInt (char1 + char2<<8 + char3<<16, unused positions zero) plus
+    its display attribute. Integer compares instead of string compares. }
+  TExtEntry = record
+    Key  : LongInt;
+    Attr : Byte;
+  end;
+
   { Represents a single file or directory entry }
   PFileEntry = ^TFileEntry;
   TFileEntry = record
@@ -137,6 +191,14 @@ type
   { Heap-allocated array to avoid hitting DSEG limitations in real mode }
   TFileArray = array[1..MAX_ENTRIES] of PFileEntry;
   PFileArray = ^TFileArray;
+
+  { All entries live in ONE contiguous pool block (a single New instead
+    of 2048 individual allocations - no heap fragmentation, no free-list
+    walks). NOTE: 2048 x 30 bytes = 61,440, which must stay under the
+    65,521-byte single-block limit - adding fields to TFileEntry or
+    raising MAX_ENTRIES can silently break this, so mind the product. }
+  TFilePool = array[1..MAX_ENTRIES] of TFileEntry;
+  PFilePool = ^TFilePool;
 
   { Heap-allocated subdirectory list for /S (was on the stack: ~3.3 KB per
     recursion level, guaranteed overflow on deep trees) }
@@ -181,6 +243,23 @@ var
   OptAmPm        : Boolean;  { 12-hour am/pm time: default from COUNTRY=
                                time format byte, /T inverts the default }
   ColorActive    : Boolean;  { /C requested AND stdout is a real console }
+  MonoMode       : Boolean;  { Video mode 7 (MDA/Hercules) - remap colors
+                               that would be invisible on mono }
+
+  { Software-tracked video state (/C): the hardware cursor is synced
+    only at the /P pause and at program exit - no Int 10h per string }
+  VidInited      : Boolean;  { Video state captured from the BDA }
+  VidSeg         : Word;     { B800h color / B000h mono }
+  VidCols        : Word;     { Columns per row (BDA 40:4A) }
+  VidRowBytes    : Word;     { VidCols * 2 }
+  VidPage        : Byte;     { Active display page }
+  CurRow, CurCol : Byte;     { Software cursor position }
+  VisOfs         : Word;     { VRAM byte offset of the visible top-left
+                               (advances during CRTC hardware scrolling) }
+  HwScrollOK     : Boolean;  { CRTC ring scrolling usable on this setup }
+  ExitSave       : Pointer;  { Chained ExitProc for crash-safe restore }
+  ExtTable       : array[1..EXT_TABLE_MAX] of TExtEntry;
+  ExtCount       : Integer;  { Entries in use (0 when /C inactive) }
 
   SortKey        : Byte;     { Active sorting mechanism }
   SortReverse    : Boolean;  { Reverse sorting order flag }
@@ -325,24 +404,36 @@ begin
   end;
 end;
 
-{ Inserts thousands separators into a raw digit string }
+{ Inserts thousands separators into a raw digit string. Single
+  right-to-left pass into a fixed buffer: the old version prepended one
+  char at a time (a full string copy per digit, O(N squared)) and ran an
+  ~80-cycle DIV ('mod 3') per digit; this uses a rolling counter and one
+  final Move. Buffer of 40 covers 64-bit values with separators + sign. }
 function CommaFy(const Raw: string): string;
 var
-  ResultStr: string;
-  Len, I, PosCount: Integer;
+  Buf        : string[40];
+  ResultStr  : string;
+  I, O       : Integer;
+  DigitCount : Integer;
 begin
-  Len := Length(Raw);
-  ResultStr := '';
-  PosCount := 0;
-
-  for I := Len downto 1 do
+  O := 40;
+  DigitCount := 0;
+  for I := Length(Raw) downto 1 do
   begin
-    ResultStr := Raw[I] + ResultStr;
-    Inc(PosCount);
-    { Separator every 3 digits, never directly after a minus sign }
-    if (PosCount mod 3 = 0) and (I > 1) and (Raw[I - 1] <> '-') then
-      ResultStr := ThousandsSep + ResultStr;
+    { Separator before every 4th digit; never adjacent to a minus sign }
+    if (Raw[I] <> '-') and (DigitCount = 3) then
+    begin
+      Buf[O] := ThousandsSep;
+      Dec(O);
+      DigitCount := 0;
+    end;
+    Buf[O] := Raw[I];
+    Dec(O);
+    if Raw[I] <> '-' then
+      Inc(DigitCount);
   end;
+  ResultStr[0] := Chr(40 - O);
+  Move(Buf[O + 1], ResultStr[1], 40 - O);
   CommaFy := ResultStr;
 end;
 
@@ -501,6 +592,89 @@ begin
   end;
 end;
 
+{ Packs up to 3 extension characters into a LongInt lookup key }
+function PackExt(C1, C2, C3: Byte): LongInt;
+var
+  K: LongInt;
+begin
+  LongRec(K).Lo := Word(C1) or (Word(C2) shl 8);
+  LongRec(K).Hi := C3;
+  PackExt := K;
+end;
+
+{ Adds a space-separated list of UPPERCASE extensions to the color table }
+procedure AddExtGroup(const List: string; Attr: Byte);
+var
+  I       : Integer;
+  C       : array[1..3] of Byte;
+  N       : Integer;
+
+  procedure Flush;
+  begin
+    if (N > 0) and (ExtCount < EXT_TABLE_MAX) then
+    begin
+      Inc(ExtCount);
+      ExtTable[ExtCount].Key  := PackExt(C[1], C[2], C[3]);
+      ExtTable[ExtCount].Attr := Attr;
+    end;
+    C[1] := 0; C[2] := 0; C[3] := 0;
+    N := 0;
+  end;
+
+begin
+  C[1] := 0; C[2] := 0; C[3] := 0;
+  N := 0;
+  for I := 1 to Length(List) do
+  begin
+    if List[I] = ' ' then
+      Flush
+    else if N < 3 then
+    begin
+      Inc(N);
+      C[N] := Ord(List[I]);
+    end;
+  end;
+  Flush;
+end;
+
+{ Builds the /C extension color table. First match wins, so the most
+  common group (executables) is loaded first. On MDA/Hercules the dark
+  gray "junk" color would be invisible, so it degrades to normal there. }
+procedure InitExtColors;
+var
+  JunkAttr: Byte;
+begin
+  ExtCount := 0;
+
+  AddExtGroup('COM EXE BAT', CLR_EXEC);
+
+  { Archives & disk images }
+  AddExtGroup('ZIP ARJ LZH LHA ARC PAK ZOO SQZ ICE HA UC2 RAR ' +
+              '7Z GZ TGZ TAR CAB BZ2 ' +
+              'IMG IMA DSK TD0 IMD VFD 360 720', CLR_ARCH);
+
+  { Documents, text & configs }
+  AddExtGroup('TXT DOC ME 1ST NFO DIZ FAQ NOW HLP MAN ASC WRI LOG ' +
+              'INI CFG', CLR_DOCS);
+
+  { Media: images, sampled audio, sequenced music, animation/video }
+  AddExtGroup('GIF PCX BMP JPG JPE TIF PNG TGA LBM IFF ' +
+              'WAV VOC SND AU MID CMF MOD S3M XM IT STM 669 MTM ' +
+              'FLI FLC AVI MPG MPE', CLR_MEDIA);
+
+  { Source code }
+  AddExtGroup('PAS ASM C H CPP HPP BAS INC MAK DPR FOR PRG PY RC DEF',
+              CLR_SRC);
+
+  { Backups & temp files: de-emphasized - except on mono adapters,
+    where attribute $08 renders invisible }
+  if MonoMode then
+    JunkAttr := CLR_NORMAL
+  else
+    JunkAttr := CLR_JUNK;
+  AddExtGroup('BAK TMP OLD', JunkAttr);
+end;
+
 { =========================================================================== }
 { OUTPUT AND PAGING UTILITIES                                                 }
 { =========================================================================== }
@@ -527,20 +701,200 @@ end;
   words directly to video memory and scrolls via BIOS Int 10h/06h - this
   needs no ANSI.SYS and no CRT unit, and is faster than DOS teletype.
   Handles CR, LF, wrap, and scroll; syncs the BIOS cursor afterwards. }
+{$IFNDEF FPC}
+{ Programs the 6845 CRTC start-address register pair (0Ch/0Dh): the
+  visible top-left of the screen moves to the given WORD offset, so the
+  hardware scrolls the display with zero memory copying. Color CRTC at
+  3D4h; the mono path never calls this. A 16-bit OUT writes the index
+  to 3D4h and the data to 3D5h in one bus operation. }
+procedure SetCRTCStart(WordOfs: Word); assembler;
+asm
+  mov  bx, WordOfs
+  mov  dx, 03D4h
+  mov  al, 0Ch          { Start Address High }
+  mov  ah, bh
+  out  dx, ax
+  mov  al, 0Dh          { Start Address Low }
+  mov  ah, bl
+  out  dx, ax
+end;
+
+{ Fills WordCount words of VRAM with BlankWord at full bus speed.
+  REP STOSW replaces a Pascal indexed loop that spent most of its
+  cycles on counter/branch overhead. }
+procedure FastBlank(Seg0, Ofs0, WordCount, BlankWord: Word); assembler;
+asm
+  mov  es, Seg0
+  mov  di, Ofs0
+  mov  cx, WordCount
+  mov  ax, BlankWord
+  cld
+  rep  stosw
+end;
+
+{ Blits Count printable characters from PSrc to VidSeg:Ofs0 with the
+  given attribute. LODSB/STOSW run inside the 8088 prefetch queue -
+  several times faster than the compiled per-character loop. Control
+  characters never reach this routine; OutStr splits runs around them. }
+procedure BlitRun(Ofs0: Word; PSrc: Pointer; Count: Word; Attr: Byte); assembler;
+asm
+  push ds
+  mov  es, VidSeg
+  mov  di, Ofs0
+  mov  cx, Count
+  mov  ah, Attr
+  lds  si, PSrc
+  cld
+  jcxz @Done
+@CharLoop:
+  lodsb
+  stosw
+  loop @CharLoop
+@Done:
+  pop  ds
+end;
+{$ENDIF}
+
+{ Captures video geometry and cursor position from the BIOS Data Area
+  once, the first time colored output happens }
+procedure InitVideoState;
+begin
+  if VidInited then Exit;
+  VidInited := True;
+  VidCols     := MemW[$0040:$004A];
+  VidRowBytes := VidCols shl 1;
+  VidPage     := Mem[$0040:$0062];
+  if MonoMode then
+    VidSeg := $B000
+  else
+    VidSeg := $B800;
+  CurCol := Mem[$0040 : $0050 + Word(VidPage) * 2];
+  CurRow := Mem[$0040 : $0051 + Word(VidPage) * 2];
+  VisOfs := MemW[$0040:$004E];
+{$IFDEF FPC}
+  HwScrollOK := False;   { No port I/O to the CRTC from this build }
+{$ELSE}
+  HwScrollOK := not MonoMode;  { MDA has only 4 KB - no ring to slide in }
+{$ENDIF}
+end;
+
+{ Writes the software cursor position to the hardware cursor. Deferred:
+  called only at the /P pause and at program exit instead of after every
+  string - each call is an Int 10h dispatch the 8088 can ill afford. }
+procedure SyncHardwareCursor;
+var
+  Regs: Registers;
+begin
+  if not (ColorActive and VidInited) then Exit;
+  FillChar(Regs, SizeOf(Regs), 0);
+  Regs.AH := $02;
+  Regs.BH := VidPage;
+  Regs.DH := CurRow;
+  Regs.DL := CurCol;
+  Intr($10, Regs);
+end;
+
+{ Puts the screen back the way DOS expects it: visible window copied to
+  VRAM offset 0, CRTC start reset, BDA synced, hardware cursor parked.
+  Installed as an ExitProc so even Halt or a runtime error can't leave
+  the user's prompt on a shifted screen. }
+procedure RestoreVideo;
+begin
+  if not (ColorActive and VidInited) then Exit;
+{$IFNDEF FPC}
+  if HwScrollOK and (VisOfs <> 0) then
+  begin
+    Move(Ptr(VidSeg, VisOfs)^, Ptr(VidSeg, 0)^,
+         Word(LinesOnScreen) * VidRowBytes);
+    VisOfs := 0;
+    SetCRTCStart(0);
+    MemW[$0040:$004E] := 0;
+  end;
+{$ENDIF}
+  SyncHardwareCursor;
+end;
+
+{$F+}
+procedure VideoExitProc;
+begin
+  ExitProc := ExitSave;
+  RestoreVideo;
+end;
+{$F-}
+
+{ Writes a string with a text attribute. Colorless mode passes straight
+  through to (buffered) DOS output. Color mode blits runs of printable
+  characters directly into video memory and scrolls via the CRTC start
+  address (hardware, zero-copy, one smooth line at a time) - falling
+  back to software jump scroll on MDA and BIOS scroll under FPC. The
+  hardware cursor is NOT touched here; see SyncHardwareCursor. }
 procedure OutStr(const S: string; Attr: Byte);
 var
-  Regs     : Registers;
-  I        : Integer;
-  Row, Col : Byte;
-  Cols     : Word;
-  Rows     : Byte;
-  VSeg     : Word;
-  POfs     : Word;
-  Page     : Byte;
-{$IFNDEF FPC}
-  W, Base  : Word;
-  Blank    : Word;
+  I, J    : Integer;
+  RunLen  : Word;
+  Rows    : Byte;
+  VOfs    : Word;
+{$IFDEF FPC}
+  Regs    : Registers;
+  K       : Integer;
 {$ENDIF}
+
+  procedure ScrollCheck;
+  begin
+    if CurRow < Rows then Exit;
+{$IFNDEF FPC}
+    if HwScrollOK then
+    begin
+      { Ring wrap: if the window would slide past 16 KB, copy the
+        visible screen back to offset 0 first (rare: every ~77 lines) }
+      if VisOfs + (Word(Rows) + 1) * VidRowBytes > RING_BYTES then
+      begin
+        Move(Ptr(VidSeg, VisOfs)^, Ptr(VidSeg, 0)^,
+             Word(Rows) * VidRowBytes);
+        VisOfs := 0;
+        SetCRTCStart(0);
+        MemW[$0040:$004E] := 0;
+        VOfs := (Word(CurRow) * VidCols + CurCol) shl 1;
+      end;
+
+      { Slide the hardware window down one row and blank the line that
+        just became the bottom. VOfs is deliberately NOT adjusted: the
+        origin advanced by exactly the amount the row number dropped. }
+      Inc(VisOfs, VidRowBytes);
+      SetCRTCStart(VisOfs shr 1);
+      MemW[$0040:$004E] := VisOfs;   { Keep the BIOS's view coherent }
+      FastBlank(VidSeg, VisOfs + Word(Rows - 1) * VidRowBytes, VidCols,
+                Word(Ord(' ')) or (Word(CLR_NORMAL) shl 8));
+      CurRow := Rows - 1;
+    end
+    else
+    begin
+      { MDA/Hercules: 4 KB VRAM, no ring - software jump scroll }
+      Move(Ptr(VidSeg, Word(SCROLL_STEP) * VidRowBytes)^,
+           Ptr(VidSeg, 0)^,
+           Word(Rows - SCROLL_STEP) * VidRowBytes);
+      FastBlank(VidSeg, Word(Rows - SCROLL_STEP) * VidRowBytes,
+                Word(SCROLL_STEP) * VidCols,
+                Word(Ord(' ')) or (Word(CLR_NORMAL) shl 8));
+      CurRow := Rows - SCROLL_STEP;
+      Dec(VOfs, Word(SCROLL_STEP) * VidRowBytes);
+    end;
+{$ELSE}
+    { Protected mode: BIOS jump scroll }
+    FillChar(Regs, SizeOf(Regs), 0);
+    Regs.AH := $06;
+    Regs.AL := SCROLL_STEP;
+    Regs.BH := CLR_NORMAL;
+    Regs.CH := 0;
+    Regs.CL := 0;
+    Regs.DH := Rows - 1;
+    Regs.DL := Byte(VidCols) - 1;
+    Intr($10, Regs);
+    CurRow := Rows - SCROLL_STEP;
+    Dec(VOfs, Word(SCROLL_STEP) * VidRowBytes);
+{$ENDIF}
+  end;
+
 begin
   if not ColorActive then
   begin
@@ -548,78 +902,57 @@ begin
     Exit;
   end;
 
-  Cols := MemW[$0040:$004A];        { BIOS: columns per row }
+  InitVideoState;
   Rows := Byte(LinesOnScreen);
-  Page := Mem[$0040:$0062];         { BIOS: active display page }
-  POfs := MemW[$0040:$004E];        { BIOS: byte offset of active page }
-  if Mem[$0040:$0049] = 7 then      { Video mode 7 = MDA/Hercules mono }
-    VSeg := $B000
-  else
-    VSeg := $B800;
+  { One multiply per string; inside the loop the offset only increments }
+  VOfs := VisOfs + (Word(CurRow) * VidCols + CurCol) shl 1;
 
-  { Fetch current cursor position once per string }
-  FillChar(Regs, SizeOf(Regs), 0);
-  Regs.AH := $03;
-  Regs.BH := Page;
-  Intr($10, Regs);
-  Row := Regs.DH;
-  Col := Regs.DL;
-
-  for I := 1 to Length(S) do
+  I := 1;
+  while I <= Length(S) do
   begin
     case S[I] of
-      #13: Col := 0;
-      #10: Inc(Row);
+      #13: begin
+             Dec(VOfs, Word(CurCol) shl 1);
+             CurCol := 0;
+             Inc(I);
+           end;
+      #10: begin
+             Inc(CurRow);
+             Inc(VOfs, VidRowBytes);
+             Inc(I);
+             ScrollCheck;
+           end;
     else
       begin
-        MemW[VSeg : POfs + (Word(Row) * Cols + Col) * 2] :=
-          Word(Ord(S[I])) or (Word(Attr) shl 8);
-        Inc(Col);
-        if Col >= Cols then
+        { Gather the longest run of printable characters that fits on
+          the current row, then blit it in one shot }
+        J := I;
+        RunLen := 0;
+        while (J <= Length(S)) and (S[J] <> #13) and (S[J] <> #10) and
+              (RunLen < VidCols - CurCol) do
         begin
-          Col := 0;
-          Inc(Row);
+          Inc(J);
+          Inc(RunLen);
+        end;
+{$IFNDEF FPC}
+        BlitRun(VOfs, @S[I], RunLen, Attr);
+{$ELSE}
+        for K := 0 to Integer(RunLen) - 1 do
+          MemW[VidSeg : VOfs + Word(K) shl 1] :=
+            Word(Ord(S[I + K])) or (Word(Attr) shl 8);
+{$ENDIF}
+        Inc(VOfs, RunLen shl 1);
+        Inc(CurCol, RunLen);
+        I := J;
+        if CurCol >= VidCols then
+        begin
+          CurCol := 0;
+          Inc(CurRow);
+          ScrollCheck;   { VOfs already sits at the start of the next row }
         end;
       end;
     end;
-
-    if Row >= Rows then
-    begin
-{$IFDEF FPC}
-      { Protected mode: no flat pointer to video RAM here, so scroll
-        via BIOS - but SCROLL_STEP lines at once to reduce call count }
-      Regs.AH := $06;
-      Regs.AL := SCROLL_STEP;
-      Regs.BH := CLR_NORMAL;
-      Regs.CH := 0;
-      Regs.CL := 0;
-      Regs.DH := Rows - 1;
-      Regs.DL := Cols - 1;
-      Intr($10, Regs);
-{$ELSE}
-      { Jump scroll: ONE block move of the whole screen up SCROLL_STEP
-        lines plus a blank fill, instead of a BIOS scroll per line. The
-        next SCROLL_STEP-1 lines then print with no scrolling at all -
-        this removes nearly all the scroll stutter on slow machines. }
-      Move(Ptr(VSeg, POfs + Word(SCROLL_STEP) * Cols * 2)^,
-           Ptr(VSeg, POfs)^,
-           Word(Rows - SCROLL_STEP) * Cols * 2);
-
-      Blank := Word(Ord(' ')) or (Word(CLR_NORMAL) shl 8);
-      Base  := POfs + Word(Rows - SCROLL_STEP) * Cols * 2;
-      for W := 0 to Word(SCROLL_STEP) * Cols - 1 do
-        MemW[VSeg : Base + W * 2] := Blank;
-{$ENDIF}
-      Row := Rows - SCROLL_STEP;
-    end;
   end;
-
-  { Park the BIOS cursor where output ended }
-  Regs.AH := $02;
-  Regs.BH := Page;
-  Regs.DH := Row;
-  Regs.DL := Col;
-  Intr($10, Regs);
 end;
 
 { Writes a string followed by CR/LF, honoring the attribute }
@@ -656,6 +989,7 @@ begin
   begin
     OutStr('Press any key to continue . . .', CLR_NORMAL);
     if not ColorActive then Flush(Output);  { Show buffered lines first }
+    SyncHardwareCursor;  { Deferred cursor: park it visibly at the prompt }
     Ch := WaitForKey;
     OutStr(#13 + '                                ' + #13, CLR_NORMAL);
     if not ColorActive then Flush(Output);
@@ -1077,17 +1411,15 @@ end;
 
 { Compares two LongInts as UNSIGNED 32-bit values. DOS packed timestamps
   use bit 31 for years >= 2044, so a signed comparison would sort such
-  files (common on flash cards written with unset RTCs) before 1980. }
+  files (common on flash cards written with unset RTCs) before 1980.
+  LongRec casts read the halves directly - 'shr 16' would cost a 16-step
+  shift loop per call on the 8088, in the sort's hottest path. }
 function CmpUnsigned(A, B: LongInt): Integer;
-var
-  HA, HB: Word;
 begin
-  HA := Word(A shr 16);
-  HB := Word(B shr 16);
-  if HA < HB then CmpUnsigned := -1
-  else if HA > HB then CmpUnsigned := 1
-  else if Word(A) < Word(B) then CmpUnsigned := -1
-  else if Word(A) > Word(B) then CmpUnsigned := 1
+  if LongRec(A).Hi < LongRec(B).Hi then CmpUnsigned := -1
+  else if LongRec(A).Hi > LongRec(B).Hi then CmpUnsigned := 1
+  else if LongRec(A).Lo < LongRec(B).Lo then CmpUnsigned := -1
+  else if LongRec(A).Lo > LongRec(B).Lo then CmpUnsigned := 1
   else CmpUnsigned := 0;
 end;
 
@@ -1312,30 +1644,53 @@ end;
 { DIRECTORY PROCESSING                                                        }
 { =========================================================================== }
 
-{ Picks the display attribute for an entry: directories yellow,
-  executables (.COM/.EXE/.BAT) green, everything else normal }
+{ Picks the display attribute for an entry: directories yellow, then a
+  packed-integer lookup in the extension color table (executables,
+  archives, documents, media, source, junk - first match wins). The 8.3
+  name's extension is packed once into a LongInt and compared against
+  the table with plain integer compares - no string operations. }
 function EntryAttr(const Entry: TFileEntry): Byte;
 var
-  E      : string[3];
-  DotPos : Integer;
+  Key      : LongInt;
+  C2, C3   : Byte;
+  DotPos   : Integer;
+  L, I     : Integer;
 begin
   if not ColorActive then
-    EntryAttr := CLR_NORMAL
-  else if (Entry.Attr and ATTR_DIRECTORY) <> 0 then
-    EntryAttr := CLR_DIR
-  else
   begin
-    { DOS returns names uppercase, so plain comparison suffices }
-    DotPos := Pos('.', Entry.Name);
-    if DotPos > 0 then
-      E := Copy(Entry.Name, DotPos + 1, 3)
-    else
-      E := '';
-    if (E = 'COM') or (E = 'EXE') or (E = 'BAT') then
-      EntryAttr := CLR_EXEC
-    else
-      EntryAttr := CLR_NORMAL;
+    EntryAttr := CLR_NORMAL;
+    Exit;
   end;
+
+  if (Entry.Attr and ATTR_DIRECTORY) <> 0 then
+  begin
+    EntryAttr := CLR_DIR;
+    Exit;
+  end;
+
+  { DOS returns names uppercase, so no case folding is needed }
+  DotPos := Pos('.', Entry.Name);
+  if (DotPos = 0) or (DotPos = Length(Entry.Name)) then
+  begin
+    EntryAttr := CLR_NORMAL;
+    Exit;
+  end;
+
+  L := Length(Entry.Name) - DotPos;   { extension length, 1..3 }
+  C2 := 0;
+  C3 := 0;
+  if L >= 2 then C2 := Ord(Entry.Name[DotPos + 2]);
+  if L >= 3 then C3 := Ord(Entry.Name[DotPos + 3]);
+  Key := PackExt(Ord(Entry.Name[DotPos + 1]), C2, C3);
+
+  for I := 1 to ExtCount do
+    if ExtTable[I].Key = Key then
+    begin
+      EntryAttr := ExtTable[I].Attr;
+      Exit;
+    end;
+
+  EntryAttr := CLR_NORMAL;
 end;
 
 { Formats and prints a single file entry according to flags (/W, /B, /L, /C) }
@@ -1531,6 +1886,7 @@ var
   SearchObj       : SearchRec;
   Count           : Integer;
   FileList        : PFileArray;
+  EntryPool       : PFilePool;    { One block holds all TFileEntry slots }
   I               : Integer;
   DirFiles        : LongInt;
   DirBytes        : Big;
@@ -1596,7 +1952,7 @@ var
       else if Count < MAX_ENTRIES then
       begin
         Inc(Count);
-        New(FileList^[Count]);
+        FileList^[Count] := @EntryPool^[Count];  { pool slot, no New() }
         FileList^[Count]^.Name := EName;
         FileList^[Count]^.Attr := EAttr;
         FileList^[Count]^.Time := ETime;
@@ -1687,10 +2043,16 @@ begin
     PrintLine('');
   end;
 
-  { Allocate file pointer array on the heap (sorted modes only) }
+  { Allocate the pointer array AND one contiguous entry pool: a single
+    pair of allocations instead of 2048 individual New() calls (which
+    fragment the heap and walk free lists per file) }
   FileList := nil;
+  EntryPool := nil;
   if not Streaming then
+  begin
     New(FileList);
+    New(EntryPool);
+  end;
 
   PoolTop := 0;  { Long-name pool resets per directory }
 
@@ -1735,7 +2097,7 @@ begin
     if Count > 1 then
       QuickSortEntries(FileList^, 1, Count);
 
-    { Display the sorted entries & clean up memory }
+    { Display the sorted entries; both blocks freed once afterwards }
     for I := 1 to Count do
     begin
       CurLfn := '';
@@ -1745,9 +2107,9 @@ begin
         Move(LfnPool^[FileList^[I]^.LOfs], CurLfn[1], FileList^[I]^.LLen);
       end;
       DisplayEntry(FileList^[I]^, Path);
-      Dispose(FileList^[I]);
     end;
     Dispose(FileList);
+    Dispose(EntryPool);
   end;
 
   { Flush uncompleted wide / two-column rows }
@@ -1816,7 +2178,7 @@ begin
   WriteLn('  /B          Bare format (no headers, bare filenames only)');
   WriteLn('  /L          Displays file names in lowercase');
   WriteLn('  /S          Recursively searches all subdirectories');
-  WriteLn('  /C          Color: directories yellow, .COM/.EXE/.BAT green');
+  WriteLn('  /C          Color by type: dirs, exec, archives, docs, media, source');
   WriteLn('  /LFN        Experimental: long filenames (Win9x DOS/DOSLFN/NTVDM)');
   WriteLn('  /H          Human-readable sizes (KB, MB, GB)');
   WriteLn('  /T          Toggle 12/24-hour time (inverts the COUNTRY= default)');
@@ -2079,6 +2441,18 @@ begin
   { Color only when /C was given AND output goes to a real console;
     redirected output (files, pipes) stays plain automatically }
   ColorActive := OptColor and StdOutIsConsole;
+  MonoMode := ColorActive and (Mem[$0040:$0049] = 7);
+  ExtCount := 0;
+  VidInited := False;
+  VisOfs := 0;
+  if ColorActive then
+  begin
+    InitExtColors;  { Extension color table only needed with /C }
+    { Crash-safe screen restore: the CRTC start address and hardware
+      cursor are put back even on Halt or a runtime error }
+    ExitSave := ExitProc;
+    ExitProc := @VideoExitProc;
+  end;
 
   { /LFN: activate the LFN path (self-disables on the first call if the
     API is absent) and allocate the long-name pool }
